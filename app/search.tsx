@@ -23,19 +23,38 @@ export function SearchComponent({ handleSubmit, input, handleInputChange, isLoad
           className="pr-16 h-16 text-lg rounded-2xl border-2 border-gray-300 dark:border-gray-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-lg transition-all duration-200 focus:border-orange-400 focus:shadow-xl focus:shadow-orange-100/50 dark:focus:shadow-orange-900/20 placeholder:text-gray-400 dark:placeholder:text-gray-400"
           disabled={isLoading}
         />
-        <Button
+        <button
           type="submit"
           disabled={isLoading || !input.trim()}
           variant="orange"
           size="icon"
           className="absolute right-3 h-10 w-10 rounded-xl shadow-md hover:shadow-lg transition-all duration-200"
+          disabled={isLoading || !input || input.trim() === ''}
+          className="absolute right-2 p-0 flex items-center justify-center rounded-lg bg-[#ff4d00] hover:bg-[#e64400] disabled:bg-gray-300 disabled:cursor-not-allowed active:scale-95 group"
         >
-          {isLoading ? (
-            <Loader2 className="h-5 w-5 animate-spin" />
-          ) : (
-            <Search className="h-5 w-5" />
-          )}
-        </Button>
+          <div className="w-[60px] h-[38px] flex items-center justify-center">
+            {isLoading ? (
+              <Loader2 className="h-5 w-5 animate-spin text-white" />
+            ) : (
+              <svg 
+                fill="none" 
+                height="20" 
+                viewBox="0 0 20 20" 
+                width="20" 
+                xmlns="http://www.w3.org/2000/svg"
+                className="text-white"
+              >
+                <path 
+                  d="M11.6667 4.79163L16.875 9.99994M16.875 9.99994L11.6667 15.2083M16.875 9.99994H3.125" 
+                  stroke="currentColor" 
+                  strokeLinecap="round" 
+                  strokeLinejoin="round" 
+                  strokeWidth="1.5"
+                />
+              </svg>
+            )}
+          </div>
+        </button>
       </div>
     </form>
   )

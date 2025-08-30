@@ -1,18 +1,30 @@
 import { NextResponse } from 'next/server'
-import { createOpenAI } from '@ai-sdk/openai'
-import { streamText, generateText, createDataStreamResponse } from 'ai'
+import { createGroq } from '@ai-sdk/groq'
+import { streamText, generateText, createUIMessageStream, createUIMessageStreamResponse, convertToModelMessages } from 'ai'
+import type { ModelMessage } from 'ai'
 import { detectCompanyTicker } from '@/lib/company-ticker-map'
 import { selectRelevantContent } from '@/lib/content-selection'
-import FirecrawlApp from '@mendable/firecrawl-js'
 
 export async function POST(request: Request) {
   const requestId = Math.random().toString(36).substring(7)
-  console.log(`[${requestId}] Fireplexity Search API called`)
+  
   try {
     const body = await request.json()
     const messages = body.messages || []
-    const query = messages[messages.length - 1]?.content || body.query
-    console.log(`[${requestId}] Query received:`, query)
+    
+    // Extract query from v5 message structure (messages have parts array)
+    let query = body.query
+    if (!query && messages.length > 0) {
+      const lastMessage = messages[messages.length - 1]
+      if (lastMessage.parts) {
+        // v5 structure
+        const textParts = lastMessage.parts.filter((p: any) => p.type === 'text')
+        query = textParts.map((p: any) => p.text).join(' ')
+      } else if (lastMessage.content) {
+        // Fallback for v4 structure
+        query = lastMessage.content
+      }
+    }
 
     if (!query) {
       return NextResponse.json({ error: 'Query is required' }, { status: 400 })
@@ -20,30 +32,28 @@ export async function POST(request: Request) {
 
     // Use API key from request body if provided, otherwise fall back to environment variable
     const firecrawlApiKey = body.firecrawlApiKey || process.env.FIRECRAWL_API_KEY
-    const openaiApiKey = process.env.OPENAI_API_KEY
+    const groqApiKey = process.env.GROQ_API_KEY
     
     if (!firecrawlApiKey) {
       return NextResponse.json({ error: 'Firecrawl API key not configured' }, { status: 500 })
     }
     
-    if (!openaiApiKey) {
-      return NextResponse.json({ error: 'OpenAI API key not configured' }, { status: 500 })
+    if (!groqApiKey) {
+      return NextResponse.json({ error: 'Groq API key not configured' }, { status: 500 })
     }
 
-    // Configure OpenAI with API key
-    const openai = createOpenAI({
-      apiKey: openaiApiKey
+    // Configure Groq with the OSS 120B model
+    const groq = createGroq({
+      apiKey: groqApiKey
     })
-
-    // Initialize Firecrawl
-    const firecrawl = new FirecrawlApp({ apiKey: firecrawlApiKey })
 
     // Always perform a fresh search for each query to ensure relevant results
     const isFollowUp = messages.length > 2
     
-    // Use createDataStreamResponse with a custom data stream
-    return createDataStreamResponse({
-      execute: async (dataStream) => {
+    // Create a UIMessage stream with custom data parts
+    const stream = createUIMessageStream({
+      originalMessages: messages,
+      execute: async ({ writer }) => {
         try {
           let sources: Array<{
             url: string
@@ -57,48 +67,145 @@ export async function POST(request: Request) {
             favicon?: string
             siteName?: string
           }> = []
+          let newsResults: Array<{
+            url: string
+            title: string
+            description?: string
+            publishedDate?: string
+            source?: string
+            image?: string
+          }> = []
+          let imageResults: Array<{
+            url: string
+            title: string
+            thumbnail?: string
+            source?: string
+            width?: number
+            height?: number
+            position?: number
+          }> = []
           let context = ''
           
-          // Always search for sources to ensure fresh, relevant results
-          dataStream.writeData({ type: 'status', message: 'Starting search...' })
-          dataStream.writeData({ type: 'status', message: 'Searching for relevant sources...' })
-            
-          const searchData = await firecrawl.search(query, {
-            limit: 6,
-            scrapeOptions: {
-              formats: ['markdown'],
-              onlyMainContent: true
-            }
+          // Send status updates as transient data parts
+          writer.write({
+            type: 'data-status',
+            id: 'status-1',
+            data: { message: 'Starting search...' },
+            transient: true
           })
           
-          // Transform sources metadata
-          sources = searchData.data?.map((item: any) => ({
-            url: item.url,
-            title: item.title || item.url,
-            description: item.description || item.metadata?.description,
-            content: item.content,
-            markdown: item.markdown,
-            publishedDate: item.publishedDate,
-            author: item.author,
-            image: item.metadata?.ogImage || item.metadata?.image,
-            favicon: item.metadata?.favicon,
-            siteName: item.metadata?.siteName,
-          })).filter((item: any) => item.url) || []
+          writer.write({
+            type: 'data-status',
+            id: 'status-2',
+            data: { message: 'Searching for relevant sources...' },
+            transient: true
+          })
+          
+          // Make direct API call to Firecrawl v2 search endpoint
+          const searchResponse = await fetch('https://api.firecrawl.dev/v2/search', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${firecrawlApiKey}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              query: query,
+              sources: ['web', 'news', 'images'],
+              limit: 6,
+              scrapeOptions: {
+                formats: ['markdown'],
+                onlyMainContent: true,
+                maxAge: 86400000  // 24 hours in milliseconds
+              }
+            })
+          })
 
-          // Send sources immediately
-          dataStream.writeData({ type: 'sources', sources })
+          if (!searchResponse.ok) {
+            const errorData = await searchResponse.json()
+            throw new Error(`Firecrawl API error: ${errorData.error || searchResponse.statusText}`)
+          }
+
+          const searchResult = await searchResponse.json()
+          const searchData = searchResult.data || {}
+          
+          // Extract results from the v2 SDK response
+          const webResults = searchData.web || []
+          const newsData = searchData.news || []
+          const imagesData = searchData.images || []
+          
+          // Transform web sources metadata
+          sources = webResults.map((item: any) => {
+            return {
+              url: item.url,
+              title: item.title || item.url,
+              description: item.description || item.snippet,
+              content: item.content,
+              markdown: item.markdown,
+              favicon: item.favicon,
+              image: item.ogImage || item.image || item.metadata?.ogImage,  // Add ogImage support
+              siteName: new URL(item.url).hostname
+            };
+          }).filter((item: any) => item.url) || []
+
+          // Transform news results - now with correct schema
+          newsResults = newsData.map((item: any) => {
+            return {
+              url: item.url,
+              title: item.title,
+              description: item.snippet || item.description,
+              publishedDate: item.date,  // Direct API returns 'date' field
+              source: item.source || (item.url ? new URL(item.url).hostname : undefined),
+              image: item.imageUrl  // Direct API returns 'imageUrl' for news thumbnails
+            };
+          }).filter((item: any) => item.url) || []
+
+          // Transform image results - now with correct schema from direct API
+          imageResults = imagesData.map((item: any) => {
+            // Verify we have the required fields
+            if (!item.url || !item.imageUrl) {
+              return null;
+            }
+            return {
+              url: item.url,
+              title: item.title || 'Untitled',
+              thumbnail: item.imageUrl,  // Direct API returns 'imageUrl' field
+              source: item.url ? new URL(item.url).hostname : undefined,
+              width: item.imageWidth,
+              height: item.imageHeight,
+              position: item.position
+            };
+          }).filter(Boolean) || []  // Filter out null entries
+          
+          // Send all sources as a persistent data part
+          writer.write({
+            type: 'data-sources',
+            id: 'sources-1',
+            data: {
+              sources,
+              newsResults,
+              imageResults
+            }
+          })
           
           // Small delay to ensure sources render first
           await new Promise(resolve => setTimeout(resolve, 300))
           
           // Update status
-          dataStream.writeData({ type: 'status', message: 'Analyzing sources and generating answer...' })
+          writer.write({
+            type: 'data-status',
+            id: 'status-3',
+            data: { message: 'Analyzing sources and generating answer...' },
+            transient: true
+          })
           
           // Detect if query is about a company
           const ticker = detectCompanyTicker(query)
-          console.log(`[${requestId}] Query: "${query}" -> Detected ticker: ${ticker}`)
           if (ticker) {
-            dataStream.writeData({ type: 'ticker', symbol: ticker })
+            writer.write({
+              type: 'data-ticker',
+              id: 'ticker-1',
+              data: { symbol: ticker }
+            })
           }
           
           // Prepare context from sources with intelligent content selection
@@ -110,11 +217,9 @@ export async function POST(request: Request) {
             })
             .join('\n\n---\n\n')
 
-          console.log(`[${requestId}] Creating text stream for query:`, query)
-          console.log(`[${requestId}] Context length:`, context.length)
           
           // Prepare messages for the AI
-          let aiMessages = []
+          let aiMessages: ModelMessage[] = []
           
           if (!isFollowUp) {
             // Initial query with sources
@@ -122,6 +227,11 @@ export async function POST(request: Request) {
               {
                 role: 'system',
                 content: `You are a friendly assistant that helps users find information.
+
+                CRITICAL FORMATTING RULE:
+                - NEVER use LaTeX/math syntax ($...$) for regular numbers in your response
+                - Write ALL numbers as plain text: "1 million" NOT "$1$ million", "50%" NOT "$50\\%$"
+                - Only use math syntax for actual mathematical equations if absolutely necessary
                 
                 RESPONSE STYLE:
                 - For greetings (hi, hello), respond warmly and ask how you can help
@@ -147,6 +257,11 @@ export async function POST(request: Request) {
               {
                 role: 'system',
                 content: `You are a friendly assistant continuing our conversation.
+
+                CRITICAL FORMATTING RULE:
+                - NEVER use LaTeX/math syntax ($...$) for regular numbers in your response
+                - Write ALL numbers as plain text: "1 million" NOT "$1$ million", "50%" NOT "$50\\%$"
+                - Only use math syntax for actual mathematical equations if absolutely necessary
                 
                 REMEMBER:
                 - Keep the same conversational tone from before
@@ -157,11 +272,8 @@ export async function POST(request: Request) {
                 - Citations should correspond to the source order (first source = [1], second = [2], etc.)
                 - Use the format [1] not CITATION_1 or any other format`
               },
-              // Include conversation context
-              ...messages.slice(0, -1).map((m: { role: string; content: string }) => ({
-                role: m.role,
-                content: m.content
-              })),
+              // Include conversation context - convert UIMessages to ModelMessages
+              ...convertToModelMessages(messages.slice(0, -1)),
               // Add the current query with the fresh sources
               {
                 role: 'user',
@@ -170,62 +282,67 @@ export async function POST(request: Request) {
             ]
           }
           
-          // Start generating follow-up questions in parallel (before streaming answer)
-          const conversationPreview = isFollowUp 
-            ? messages.map((m: { role: string; content: string }) => `${m.role}: ${m.content}`).join('\n\n')
-            : `user: ${query}`
-            
-          const followUpPromise = generateText({
-            model: openai('gpt-4o-mini'),
-            messages: [
-              {
-                role: 'system',
-                content: `Generate 5 natural follow-up questions based on the query and context.\n                \n                ONLY generate questions if the query warrants them:\n                - Skip for simple greetings or basic acknowledgments\n                - Create questions that feel natural, not forced\n                - Make them genuinely helpful, not just filler\n                - Focus on the topic and sources available\n                \n                If the query doesn't need follow-ups, return an empty response.
-                ${isFollowUp ? 'Consider the full conversation history and avoid repeating previous questions.' : ''}
-                Return only the questions, one per line, no numbering or bullets.`
-              },
-              {
-                role: 'user',
-                content: `Query: ${query}\n\nConversation context:\n${conversationPreview}\n\n${sources.length > 0 ? `Available sources about: ${sources.map((s: { title: string }) => s.title).join(', ')}\n\n` : ''}Generate 5 diverse follow-up questions that would help the user learn more about this topic from different angles.`
-              }
-            ],
-            temperature: 0.7,
-            maxTokens: 150,
-          })
-          
-          // Stream the text generation
+          // Stream the text generation using Groq's Kimi K2 Instruct model
           const result = streamText({
-            model: openai('gpt-4o-mini'),
+            model: groq('moonshotai/kimi-k2-instruct'),
             messages: aiMessages,
             temperature: 0.7,
-            maxTokens: 2000
+            maxRetries: 2
           })
           
-          // Merge the text stream into the data stream
-          // This ensures proper ordering of text chunks
-          result.mergeIntoDataStream(dataStream)
+          // Merge the AI stream into our UIMessage stream
+          writer.merge(result.toUIMessageStream())
           
-          // Wait for both the text generation and follow-up questions
-          const [fullAnswer, followUpResponse] = await Promise.all([
-            result.text,
-            followUpPromise
-          ])
+          // Get the full answer for follow-up generation
+          const fullAnswer = await result.text
           
-          // Process follow-up questions
-          const followUpQuestions = followUpResponse.text
-            .split('\n')
-            .map((q: string) => q.trim())
-            .filter((q: string) => q.length > 0)
-            .slice(0, 5)
+          // Generate follow-up questions
+          const conversationPreview = isFollowUp 
+            ? messages.map((m: { role: string; parts?: any[] }) => {
+                const content = m.parts 
+                  ? m.parts.filter((p: any) => p.type === 'text').map((p: any) => p.text).join(' ')
+                  : ''
+                return `${m.role}: ${content}`
+              }).join('\n\n')
+            : `user: ${query}`
+            
+          try {
+            const followUpResponse = await generateText({
+              model: groq('moonshotai/kimi-k2-instruct'),
+              messages: [
+                {
+                  role: 'system',
+                  content: `Generate 5 natural follow-up questions based on the query and answer.\n                \n                ONLY generate questions if the query warrants them:\n                - Skip for simple greetings or basic acknowledgments\n                - Create questions that feel natural, not forced\n                - Make them genuinely helpful, not just filler\n                - Focus on the topic and sources available\n                \n                If the query doesn't need follow-ups, return an empty response.
+                  ${isFollowUp ? 'Consider the full conversation history and avoid repeating previous questions.' : ''}
+                  Return only the questions, one per line, no numbering or bullets.`
+                },
+                {
+                  role: 'user',
+                  content: `Query: ${query}\n\nAnswer provided: ${fullAnswer.substring(0, 500)}...\n\n${sources.length > 0 ? `Available sources about: ${sources.map((s: { title: string }) => s.title).join(', ')}\n\n` : ''}Generate 5 diverse follow-up questions that would help the user learn more about this topic from different angles.`
+                }
+              ],
+              temperature: 0.7,
+              maxRetries: 2
+            })
+            
+            // Process follow-up questions
+            const followUpQuestions = followUpResponse.text
+              .split('\n')
+              .map((q: string) => q.trim())
+              .filter((q: string) => q.length > 0)
+              .slice(0, 5)
 
-          // Send follow-up questions after the answer is complete
-          dataStream.writeData({ type: 'follow_up_questions', questions: followUpQuestions })
-          
-          // Signal completion
-          dataStream.writeData({ type: 'complete' })
+            // Send follow-up questions as a data part
+            writer.write({
+              type: 'data-followup',
+              id: 'followup-1',
+              data: { questions: followUpQuestions }
+            })
+          } catch (followUpError) {
+            // Error generating follow-up questions
+          }
           
         } catch (error) {
-          console.error('Stream error:', error)
           
           // Handle specific error types
           const errorMessage = error instanceof Error ? error.message : 'Unknown error'
@@ -259,32 +376,25 @@ export async function POST(request: Request) {
             ? errorResponses[statusCode as keyof typeof errorResponses]
             : { error: errorMessage }
           
-          const errorData: Record<string, any> = { 
-            type: 'error', 
-            error: errorResponse.error
-          }
-          
-          if (errorResponse.suggestion) {
-            errorData.suggestion = errorResponse.suggestion
-          }
-          
-          if (statusCode) {
-            errorData.statusCode = statusCode
-          }
-          
-          dataStream.writeData(errorData)
+          writer.write({
+            type: 'data-error',
+            id: 'error-1',
+            data: {
+              error: errorResponse.error,
+              ...(errorResponse.suggestion ? { suggestion: errorResponse.suggestion } : {}),
+              ...(statusCode ? { statusCode } : {})
+            },
+            transient: true
+          })
         }
-      },
-      headers: {
-        'x-vercel-ai-data-stream': 'v1',
-      },
+      }
     })
     
+    return createUIMessageStreamResponse({ stream })
+    
   } catch (error) {
-    console.error('Search API error:', error)
     const errorMessage = error instanceof Error ? error.message : 'Unknown error'
     const errorStack = error instanceof Error ? error.stack : ''
-    console.error('Error details:', { errorMessage, errorStack })
     return NextResponse.json(
       { error: 'Search failed', message: errorMessage, details: errorStack },
       { status: 500 }
